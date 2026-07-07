@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Simulador de gravedad N-cuerpos — Barnes-Hut</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0a0b0f;
+    color: #e4e4e7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9a9aa0; font-size: 14px; margin: 0 0 20px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  button {
+    background: #1a1b22; color: #e4e4e7; border: 1px solid #2e2f38;
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #24252e; border-color: #3e3f4a; }
+  button:active { transform: scale(0.98); }
+  .stage {
+    position: relative; width: 100%; max-width: 1000px; aspect-ratio: 16/10;
+    background: #05060a; border-radius: 12px; overflow: hidden;
+    border: 1px solid #24252e; margin: 0 auto;
+  }
+  canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #stats {
+    position: absolute; top: 8px; left: 10px; font-family: "SF Mono", Consolas, monospace;
+    font-size: 11px; color: #9aa; pointer-events: none;
+  }
+  .hint { font-size: 12px; color: #77787f; margin: 10px 0 20px; text-align: center; }
+  .sliders {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px,1fr));
+    gap: 14px 24px; max-width: 1000px; margin: 0 auto;
+  }
+  .sliders label { font-size: 13px; color: #b0b0b6; display: block; margin-bottom: 4px; }
+  .sliders b { color: #fff; font-weight: 500; }
+  input[type=range] { width: 100%; }
+  .checkline { display: flex; align-items: center; gap: 8px; }
+  input[type=checkbox] { width: auto; }
+  footer { text-align: center; color: #55565d; font-size: 11px; margin-top: 28px; }
+</style>
+</head>
+<body>
+
+<h1>Simulador de gravedad N-cuerpos</h1>
+<p class="sub">Algoritmo Barnes-Hut con quadtree — O(n log n) en vez de O(n²)</p>
+
+<div class="controls">
+  <button id="p-galaxy">Galaxia espiral</button>
+  <button id="p-binary">Colisión binaria</button>
+  <button id="p-chaos">Caos</button>
+  <button id="p-solar">Sistema solar</button>
+  <button id="p-clear">Vaciar</button>
+</div>
+
+<div class="stage">
+  <canvas id="cv"></canvas>
+  <div id="stats">--</div>
+</div>
+
+<p class="hint">Arrastrá con el mouse para lanzar un cuerpo con velocidad. Shift+click para crear un pozo gravitacional masivo.</p>
+
+<div class="sliders">
+  <div>
+    <label>Gravedad (G): <b id="g-out">1.0</b></label>
+    <input type="range" id="g-slider" min="0.1" max="5" step="0.1" value="1">
+  </div>
+  <div>
+    <label>Velocidad de simulación: <b id="t-out">1.0x</b></label>
+    <input type="range" id="t-slider" min="0.2" max="3" step="0.1" value="1">
+  </div>
+  <div>
+    <label>Precisión Barnes-Hut (theta): <b id="th-out">0.6</b></label>
+    <input type="range" id="th-slider" min="0.2" max="1.5" step="0.05" value="0.6">
+  </div>
+  <div class="checkline">
+    <input type="checkbox" id="trails" checked>
+    <label for="trails" style="margin:0;">Estelas luminosas</label>
+  </div>
+</div>
+
+<footer>Hecho con Claude — quadtree Barnes-Hut, fusión de colisiones con conservación de momento, coloreado por velocidad.</footer>
+
+<script>
+(function(){
+const canvas = document.getElementById('cv');
+const ctx = canvas.getContext('2d');
+let W=800, H=500;
+function resize(){
+  const rect = canvas.parentElement.getBoundingClientRect();
+  W = canvas.width = rect.width;
+  H = canvas.height = rect.height;
+}
+resize();
+window.addEventListener('resize', resize);
+
+let bodies = [];
+let G = 1.0;
+let timeScale = 1.0;
+let theta = 0.6;
+let showTrails = true;
+
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+function makeBody(x,y,vx,vy,mass,color){
+  return {x,y,vx,vy,mass,radius:Math.max(1.2,Math.cbrt(mass)*1.3),color: color || hslForVel(0)};
+}
+
+function hslForVel(speed){
+  const t = Math.min(speed/6,1);
+  const hue = 220 - t*220;
+  return `hsl(${hue},85%,${60+t*15}%)`;
+}
+
+class QuadNode{
+  constructor(x,y,size){
+    this.x=x; this.y=y; this.size=size;
+    this.mass=0; this.cx=0; this.cy=0;
+    this.body=null; this.children=null;
+  }
+  insert(b){
+    if(this.mass===0 && !this.children){
+      this.body=b; this.mass=b.mass; this.cx=b.x; this.cy=b.y;
+      return;
+    }
+    if(!this.children){
+      this.subdivide();
+      const old=this.body;
+      this.body=null;
+      this.place(old);
+    }
+    this.place(b);
+    const totalMass = this.mass + b.mass;
+    this.cx = (this.cx*this.mass + b.x*b.mass)/totalMass;
+    this.cy = (this.cy*this.mass + b.y*b.mass)/totalMass;
+    this.mass = totalMass;
+  }
+  subdivide(){
+    const hs=this.size/2;
+    this.children=[
+      new QuadNode(this.x,this.y,hs),
+      new QuadNode(this.x+hs,this.y,hs),
+      new QuadNode(this.x,this.y+hs,hs),
+      new QuadNode(this.x+hs,this.y+hs,hs)
+    ];
+  }
+  place(b){
+    const hs=this.size/2;
+    const idx = (b.x>=this.x+hs?1:0) + (b.y>=this.y+hs?2:0);
+    this.children[idx].insert(b);
+  }
+  force(b, G){
+    let fx=0, fy=0;
+    if(this.mass===0) return [0,0];
+    if(this.body===b) return [0,0];
+    const dx=this.cx-b.x, dy=this.cy-b.y;
+    const distSq = dx*dx+dy*dy+4;
+    const dist = Math.sqrt(distSq);
+    if(this.body || this.size/dist < theta){
+      const f = G*this.mass*b.mass/distSq;
+      fx += f*dx/dist; fy += f*dy/dist;
+      return [fx,fy];
+    } else if(this.children){
+      for(const c of this.children){
+        const [cfx,cfy] = c.force(b,G);
+        fx+=cfx; fy+=cfy;
+      }
+      return [fx,fy];
+    }
+    return [0,0];
+  }
+}
+
+function buildTree(){
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  for(const b of bodies){
+    if(b.x<minX)minX=b.x; if(b.x>maxX)maxX=b.x;
+    if(b.y<minY)minY=b.y; if(b.y>maxY)maxY=b.y;
+  }
+  const size = Math.max(maxX-minX, maxY-minY, 100)*1.2;
+  const root = new QuadNode(minX-size*0.1, minY-size*0.1, size*1.2);
+  for(const b of bodies) root.insert(b);
+  return root;
+}
+
+function step(dt){
+  if(bodies.length===0) return;
+  const tree = buildTree();
+  for(const b of bodies){
+    const [fx,fy] = tree.force(b,G);
+    b.ax = fx/b.mass; b.ay = fy/b.mass;
+  }
+  for(const b of bodies){
+    b.vx += b.ax*dt; b.vy += b.ay*dt;
+    b.x += b.vx*dt; b.y += b.vy*dt;
+  }
+  for(let i=bodies.length-1;i>=0;i--){
+    for(let j=i-1;j>=0;j--){
+      const a=bodies[i], b=bodies[j];
+      if(!a||!b) continue;
+      const dx=a.x-b.x, dy=a.y-b.y;
+      const d = Math.sqrt(dx*dx+dy*dy);
+      if(d < (a.radius+b.radius)*0.8){
+        const totalMass = a.mass+b.mass;
+        b.vx = (a.vx*a.mass + b.vx*b.mass)/totalMass;
+        b.vy = (a.vy*a.mass + b.vy*b.mass)/totalMass;
+        b.x = (a.x*a.mass + b.x*b.mass)/totalMass;
+        b.y = (a.y*a.mass + b.y*b.mass)/totalMass;
+        b.mass = totalMass;
+        b.radius = Math.max(1.2,Math.cbrt(totalMass)*1.3);
+        bodies.splice(i,1);
+        break;
+      }
+    }
+  }
+}
+
+function draw(){
+  if(showTrails){
+    ctx.fillStyle='rgba(5,6,10,0.18)';
+    ctx.fillRect(0,0,W,H);
+  } else {
+    ctx.fillStyle='#05060a';
+    ctx.fillRect(0,0,W,H);
+  }
+  ctx.globalCompositeOperation='lighter';
+  for(const b of bodies){
+    const speed = Math.hypot(b.vx,b.vy);
+    const col = hslForVel(speed);
+    ctx.beginPath();
+    ctx.fillStyle=col;
+    ctx.arc(b.x,b.y,b.radius,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalCompositeOperation='source-over';
+}
+
+let lastT=performance.now();
+let frames=0, fps=0, lastFpsT=performance.now();
+function loop(now){
+  const dt = Math.min((now-lastT)/16.67,3)*0.6*timeScale;
+  lastT=now;
+  step(dt);
+  draw();
+  frames++;
+  if(now-lastFpsT>500){
+    fps=Math.round(frames*1000/(now-lastFpsT));
+    frames=0; lastFpsT=now;
+    document.getElementById('stats').textContent = `cuerpos: ${bodies.length}  |  fps: ${fps}`;
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function clearAll(){ bodies=[]; }
+
+function spiralGalaxy(){
+  clearAll();
+  const cx=W/2, cy=H/2;
+  bodies.push(makeBody(cx,cy,0,0,3000,'#fff'));
+  const n=700;
+  for(let i=0;i<n;i++){
+    const r = rand(20,Math.min(W,H)*0.42);
+    const ang = rand(0,Math.PI*2) + r*0.01;
+    const x = cx + Math.cos(ang)*r;
+    const y = cy + Math.sin(ang)*r*0.55;
+    const orbitalV = Math.sqrt(G*3000/r)*0.9;
+    const vx = -Math.sin(ang)*orbitalV;
+    const vy = Math.cos(ang)*orbitalV*0.55;
+    bodies.push(makeBody(x,y,vx,vy,rand(0.5,2)));
+  }
+}
+
+function binaryCollision(){
+  clearAll();
+  const cx=W/2, cy=H/2;
+  const sep=W*0.28;
+  bodies.push(makeBody(cx-sep,cy,0,1.1,1800,'#fc8'));
+  bodies.push(makeBody(cx+sep,cy,0,-1.1,1800,'#8cf'));
+  for(let i=0;i<250;i++){
+    const r = rand(15,sep*0.55);
+    const ang = rand(0,Math.PI*2);
+    const ox = cx-sep, oy=cy;
+    const x=ox+Math.cos(ang)*r, y=oy+Math.sin(ang)*r;
+    const v = Math.sqrt(G*1800/r)*0.85;
+    bodies.push(makeBody(x,y,-Math.sin(ang)*v, 1.1+Math.cos(ang)*v, rand(0.3,1)));
+  }
+  for(let i=0;i<250;i++){
+    const r = rand(15,sep*0.55);
+    const ang = rand(0,Math.PI*2);
+    const ox = cx+sep, oy=cy;
+    const x=ox+Math.cos(ang)*r, y=oy+Math.sin(ang)*r;
+    const v = Math.sqrt(G*1800/r)*0.85;
+    bodies.push(makeBody(x,y,-Math.sin(ang)*v, -1.1+Math.cos(ang)*v, rand(0.3,1)));
+  }
+}
+
+function chaos(){
+  clearAll();
+  for(let i=0;i<450;i++){
+    bodies.push(makeBody(rand(0,W),rand(0,H),rand(-1.5,1.5),rand(-1.5,1.5),rand(1,25)));
+  }
+}
+
+function solarSystem(){
+  clearAll();
+  const cx=W/2, cy=H/2;
+  bodies.push(makeBody(cx,cy,0,0,5000,'#ffdd88'));
+  const planets=[[40,8],[65,15],[95,20],[140,25],[190,60],[240,50]];
+  for(const [r,m] of planets){
+    const v = Math.sqrt(G*5000/r);
+    bodies.push(makeBody(cx+r,cy,0,v,m));
+  }
+}
+
+document.getElementById('p-galaxy').onclick=spiralGalaxy;
+document.getElementById('p-binary').onclick=binaryCollision;
+document.getElementById('p-chaos').onclick=chaos;
+document.getElementById('p-solar').onclick=solarSystem;
+document.getElementById('p-clear').onclick=clearAll;
+
+document.getElementById('g-slider').oninput=function(e){
+  G = parseFloat(e.target.value);
+  document.getElementById('g-out').textContent = G.toFixed(1);
+};
+document.getElementById('t-slider').oninput=function(e){
+  timeScale = parseFloat(e.target.value);
+  document.getElementById('t-out').textContent = timeScale.toFixed(1)+'x';
+};
+document.getElementById('th-slider').oninput=function(e){
+  theta = parseFloat(e.target.value);
+  document.getElementById('th-out').textContent = theta.toFixed(2);
+};
+document.getElementById('trails').onchange=function(e){
+  showTrails = e.target.checked;
+};
+
+let dragStart=null;
+canvas.addEventListener('mousedown', (e)=>{
+  const rect=canvas.getBoundingClientRect();
+  const x=(e.clientX-rect.left)*(W/rect.width);
+  const y=(e.clientY-rect.top)*(H/rect.height);
+  if(e.shiftKey){
+    bodies.push(makeBody(x,y,0,0,2000,'#f88'));
+    return;
+  }
+  dragStart={x,y};
+});
+canvas.addEventListener('mouseup',(e)=>{
+  if(!dragStart) return;
+  const rect=canvas.getBoundingClientRect();
+  const x=(e.clientX-rect.left)*(W/rect.width);
+  const y=(e.clientY-rect.top)*(H/rect.height);
+  const vx=(x-dragStart.x)*0.06;
+  const vy=(y-dragStart.y)*0.06;
+  bodies.push(makeBody(dragStart.x,dragStart.y,vx,vy,rand(5,20)));
+  dragStart=null;
+});
+
+spiralGalaxy();
+})();
+</script>
+</body>
+</html>
